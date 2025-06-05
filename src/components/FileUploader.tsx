@@ -2,6 +2,7 @@
 import { useState, useRef } from "react";
 import { Upload, FileText, Loader2 } from "lucide-react";
 import { useLogContext } from "../contexts/LogContext";
+import { Navigate, useNavigate } from "react-router-dom";
 
 interface FileUploaderProps {
   onFileUpload: (file: File) => void;
@@ -14,6 +15,7 @@ const FileUploader = ({ onFileUpload, isProcessing, setIsProcessing }: FileUploa
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { uploadLog } = useLogContext();
 
+  const navigate = useNavigate();
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(true);
@@ -53,7 +55,10 @@ const FileUploader = ({ onFileUpload, isProcessing, setIsProcessing }: FileUploa
     setIsProcessing(true);
     
     try {
-      await uploadLog(file);
+      const response: { status: string } = await uploadLog(file);
+      if (response.status === "completed") {
+        navigate('/analyze');
+      }
       onFileUpload(file);
     } catch (error) {
       console.error('Error uploading file:', error);

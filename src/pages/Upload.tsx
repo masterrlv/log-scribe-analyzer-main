@@ -1,5 +1,5 @@
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowLeft, FileText, AlertCircle } from "lucide-react";
 import FileUploader from "../components/FileUploader";
@@ -14,14 +14,15 @@ const UploadPage = () => {
   const handleFileUpload = async (file: File) => {
     setUploadedFile(file);
     
-    // Wait a moment for processing to complete, then navigate
-    // setTimeout(() => {
-    //   if (logEntries.length > 0) {
-    //     navigate("/analyze");
-    //   }
-    // }, 1000);
+
+  //   setTimeout(() => {
+  //     if (logEntries.length > 0) {
+  //       navigate("/analyze");
+  //     }
+  //   }, 1000);
   };
 
+  useEffect(()=>{console.log(isProcessing)},[isProcessing])
   return (
     <div className="min-h-screen bg-slate-900 text-white">
       {/* Header */}

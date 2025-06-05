@@ -96,38 +96,43 @@ export const LogProvider = ({ children }: LogProviderProps) => {
     }
   };
 
-  const uploadLog = async (file: File) => {
-    try {
-      setLoading(true);
-      const response = await apiService.uploadLogFile(file);
-      setCurrentUploadId(response.upload_id);
-      setUploadedFileName(file.name);
-      
-      // Poll for upload completion
-      const pollStatus = async () => {
-        try {
-          const status = await apiService.getUploadStatus(response.upload_id);
-          if (status.status === 'completed') {
-            await refreshAnalysis();
-            await searchLogs({ per_page: 100 }); // Load initial data
-          } else if (status.status === 'processing') {
-            setTimeout(pollStatus, 2000); // Poll every 2 seconds
-          } else if (status.status === 'failed') {
-            throw new Error('Upload processing failed');
-          }
-        } catch (error) {
-          console.error('Error checking upload status:', error);
+ // In LogContext.tsx
+const uploadLog = async (file: File) => {
+  try {
+    setLoading(true);
+    const response = await apiService.uploadLogFile(file);
+    setCurrentUploadId(response.upload_id);
+    setUploadedFileName(file.name);
+    
+    // Poll for upload completion
+    const pollStatus = async (): Promise<{ status: string }> => {
+      try {
+        const status = await apiService.getUploadStatus(response.upload_id);
+        if (status.status === 'completed') {
+          await refreshAnalysis();
+          await searchLogs({ per_page: 100 });
+          return { status: 'completed' };
+        } else if (status.status === 'processing') {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          return pollStatus();
+        } else if (status.status === 'failed') {
+          throw new Error('Upload processing failed');
         }
-      };
-      
-      pollStatus();
-    } catch (error) {
-      console.error('Failed to upload log:', error);
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
+        return status;
+      } catch (error) {
+        console.error('Error checking upload status:', error);
+        throw error;
+      }
+    };
+    
+    return await pollStatus();
+  } catch (error) {
+    console.error('Failed to upload log:', error);
+    throw error;
+  } finally {
+    setLoading(false);
+  }
+};
 
   const refreshAnalysis = async () => {
     try {

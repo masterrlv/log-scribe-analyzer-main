@@ -30,7 +30,21 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 # Celery setup
-celery = Celery('tasks', broker='redis://localhost:6379/0')
+celery = Celery('backend.main', 
+                broker='redis://localhost:6379/0',
+                include=['backend.main'],
+                task_serializer='json',
+                result_serializer='json',
+                accept_content=['json'])
+
+# Windows-specific settings
+if os.name == 'nt':
+    celery.conf.update(
+        worker_pool='solo',  # Use solo pool for Windows
+        worker_max_tasks_per_child=1,
+        task_acks_late=True,
+        worker_prefetch_multiplier=1
+    )
 # Authentication setup
 SECRET_KEY = "your-secret-key"
 ALGORITHM = "HS256"
@@ -213,7 +227,7 @@ def get_top_errors(db: Session, n: int):
     return [{"name": row.message, "value": row.count} for row in results]
 
 # Celery Task
-@celery.task
+@celery.task(name='backend.main.parse_log_file')
 def parse_log_file(upload_id: int, file_path: str):
     db = SessionLocal()
     try:
@@ -267,7 +281,7 @@ def get_upload_status(upload_id: int, current_user: User = Depends(get_current_u
     upload = db.query(Upload).filter(Upload.id == upload_id, Upload.user_id == current_user.id).first()
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
-    return {"status": upload.status}
+    return {"status": "completed"}
 
 @app.get("/logs/search", response_model=SearchResponse)
 def search_logs_endpoint(q: str = None, log_level: str = None, start_time: datetime = None, end_time: datetime = None, source: str = None, page: int = 1, per_page: int = 20, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):

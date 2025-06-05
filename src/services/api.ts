@@ -111,7 +111,8 @@ class ApiService {
       throw new Error('Upload failed');
     }
 
-    return response.json();
+    const data: ApiUploadResponse = await response.json();
+    return data;
   }
 
   async getUploadStatus(uploadId: number): Promise<ApiUploadStatus> {
