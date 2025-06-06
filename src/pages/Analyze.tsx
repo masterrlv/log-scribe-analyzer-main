@@ -20,7 +20,7 @@ const AnalyzePage = () => {
   const fileSize = logAnalysis ? 
     `${(logAnalysis.totalEntries * 100 / 1024).toFixed(1)} KB` : 
     '0 KB';
-
+  console.log("Log Analysis Data:");
   return (
     <div className="min-h-screen bg-slate-900 text-white">
       {/* Header */}

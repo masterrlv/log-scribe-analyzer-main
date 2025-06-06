@@ -1,16 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.schema import ForeignKey
 from pydantic import BaseModel
 from datetime import datetime
 import jwt
-import re
 import os
 from passlib.context import CryptContext
-from celery import Celery
 from backend import parser
 
 # FastAPI app setup
@@ -19,34 +18,20 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080"],  # Vite dev server
+    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:8080")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # Database setup
 DATABASE_URL = "postgresql://logs:logs_db@localhost:5432/logs_db"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
-# Celery setup
-celery = Celery('backend.main', 
-                broker='redis://localhost:6379/0',
-                include=['backend.main'],
-                task_serializer='json',
-                result_serializer='json',
-                accept_content=['json'])
 
-# Windows-specific settings
-if os.name == 'nt':
-    celery.conf.update(
-        worker_pool='solo',  # Use solo pool for Windows
-        worker_max_tasks_per_child=1,
-        task_acks_late=True,
-        worker_prefetch_multiplier=1
-    )
 # Authentication setup
-SECRET_KEY = "your-secret-key"
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
@@ -61,24 +46,26 @@ class User(Base):
     role = Column(String, default="viewer")
 
 class Upload(Base):
-    __tablename__ = "uploads"
+    __tablename__ = "log_file"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     filename = Column(String)
     size = Column(Integer)
-    upload_timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(String, default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     status = Column(String, default="processing")
 
 class LogEntry(Base):
     __tablename__ = "log_entries"
     id = Column(Integer, primary_key=True, index=True)
-    upload_id = Column(Integer)
-    timestamp = Column(DateTime)
+    log_file_id = Column(Integer)
+    user_id = Column(Integer)
+    timestamp = Column(String)
     log_level = Column(String, index=True)
     source = Column(String, index=True)
     message = Column(String)
     additional_fields = Column(JSON)
 
+# Table creation
 Base.metadata.create_all(bind=engine)
 
 # Pydantic Schemas
@@ -98,7 +85,7 @@ class UserResponse(BaseModel):
 
 class LogEntryResponse(BaseModel):
     id: int
-    timestamp: datetime
+    timestamp: str
     log_level: str
     source: str
     message: str
@@ -125,7 +112,7 @@ class DistributionItem(BaseModel):
     value: int
 
 class AnalyticsResponse(BaseModel):
-    series: list[dict]
+    series: list[SeriesData]
 
 # Dependency
 def get_db():
@@ -177,8 +164,16 @@ def create_upload(db: Session, user_id: int, filename: str, size: int):
     db.refresh(upload)
     return upload
 
-def bulk_insert_log_entries(db: Session, upload_id: int, log_entries: list[dict]):
-    entries = [LogEntry(upload_id=upload_id, **entry) for entry in log_entries]
+def bulk_insert_log_entries(db, upload_id: int, log_entries: list, upload_timestamp: str):
+    entries = [LogEntry(
+        log_file_id=upload_id,
+        user_id=entry.get('user_id'),
+        timestamp=upload_timestamp,  # Use the upload's timestamp
+        log_level=entry.get('log_level'),
+        message=entry.get('message'),
+        source=entry.get('source'),
+        additional_fields=entry.get('additional_fields', {})
+    ) for entry in log_entries]
     db.bulk_save_objects(entries)
     db.commit()
 
@@ -195,42 +190,47 @@ def search_logs(db: Session, q: str = None, log_level: str = None, start_time: d
     if log_level:
         query = query.filter(LogEntry.log_level == log_level)
     if start_time:
-        query = query.filter(LogEntry.timestamp >= start_time)
+        query = query.filter(LogEntry.timestamp >= start_time.strftime("%Y-%m-%d %H:%M:%S"))
     if end_time:
-        query = query.filter(LogEntry.timestamp <= end_time)
+        query = query.filter(LogEntry.timestamp <= end_time.strftime("%Y-%m-%d %H:%M:%S"))
     if source:
         query = query.filter(LogEntry.source == source)
     
     total = query.count()
     logs = query.offset((page - 1) * per_page).limit(per_page).all()
-    return {"logs": logs, "total": total, "page": page, "per_page": per_page}
+    return SearchResponse(logs=[LogEntryResponse.from_orm(log) for log in logs], total=total, page=page, per_page=per_page)
 
 def get_time_series(db: Session, start_time: datetime, end_time: datetime, interval: str):
-    time_trunc = func.date_trunc(interval, LogEntry.timestamp)
+    time_trunc = func.date_trunc(interval, func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS'))
     query = db.query(time_trunc.label('time'), func.count().label('count')).filter(
-        LogEntry.timestamp >= start_time, LogEntry.timestamp <= end_time
+        func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS') >= start_time,
+        func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS') <= end_time
     ).group_by('time').order_by('time')
     results = query.all()
-    return [{"x": row.time.isoformat(), "y": row.count} for row in results]
+    data = [{"x": row.time.isoformat(), "y": row.count} for row in results]
+    return [SeriesData(name="Log Count", data=data)]
 
 def get_distribution(db: Session, field: str):
     group_field = getattr(LogEntry, field)
     query = db.query(group_field.label('name'), func.count().label('value')).group_by(group_field)
     results = query.all()
-    return [{"name": row.name, "value": row.value} for row in results]
+    return [DistributionItem(name=row.name, value=row.value) for row in results]
 
 def get_top_errors(db: Session, n: int):
     query = db.query(LogEntry.message, func.count().label('count')).filter(
         LogEntry.log_level == 'ERROR'
     ).group_by(LogEntry.message).order_by(func.count().desc()).limit(n)
     results = query.all()
-    return [{"name": row.message, "value": row.count} for row in results]
+    return [DistributionItem(name=row.message, value=row.count) for row in results]
 
-# Celery Task
-@celery.task(name='backend.main.parse_log_file')
-def parse_log_file(upload_id: int, file_path: str):
-    db = SessionLocal()
+def parse_log_file(upload_id: int, file_path: str, db: Session = Depends(get_db)):
     try:
+        # Get the upload record to retrieve its timestamp
+        upload = db.query(Upload).filter(Upload.id == upload_id).first()
+        if not upload:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        
+        upload_timestamp = upload.timestamp  # Use the upload's timestamp
         with open(file_path, 'r') as f:
             lines = f.readlines()
         log_entries = []
@@ -242,10 +242,13 @@ def parse_log_file(upload_id: int, file_path: str):
         if not log_entries:
             update_upload_status(db, upload_id, 'failed')
             return
-        bulk_insert_log_entries(db, upload_id, log_entries)
+        bulk_insert_log_entries(db, upload_id, log_entries, upload_timestamp)
         update_upload_status(db, upload_id, 'completed')
+    except Exception as e:
+        db.rollback()
+        update_upload_status(db, upload_id, 'failed')
+        raise HTTPException(status_code=500, detail=f"Log parsing failed: {str(e)}")
     finally:
-        db.close()
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -266,38 +269,80 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/logs/upload")
-async def upload_log(file: UploadFile = File(...), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def upload_log(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None
+):
     if not file.filename.endswith(('.log', '.txt', '.json')):
         raise HTTPException(status_code=400, detail="Invalid file type")
     file_path = f"temp_{file.filename}"
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-    upload = create_upload(db, current_user.id, file.filename, file.size)
-    parse_log_file.delay(upload.id, file_path)
-    return {"upload_id": upload.id, "status": "processing"}
+    try:
+        file_content = await file.read()
+        file_size = len(file_content)
+        with open(file_path, "wb") as f:
+            f.write(file_content)
+        upload = create_upload(db, current_user.id, file.filename, file_size)
+        background_tasks.add_task(parse_log_file, upload.id, file_path, db)
+        return {"upload_id": upload.id, "status": "processing"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
 
 @app.get("/logs/upload/{upload_id}/status")
 def get_upload_status(upload_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     upload = db.query(Upload).filter(Upload.id == upload_id, Upload.user_id == current_user.id).first()
     if not upload:
         raise HTTPException(status_code=404, detail="Upload not found")
-    return {"status": "completed"}
+    return {"status": upload.status}
 
 @app.get("/logs/search", response_model=SearchResponse)
-def search_logs_endpoint(q: str = None, log_level: str = None, start_time: datetime = None, end_time: datetime = None, source: str = None, page: int = 1, per_page: int = 20, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def search_logs_endpoint(
+    q: str = None,
+    log_level: str = None,
+    start_time: datetime = None,
+    end_time: datetime = None,
+    source: str = None,
+    page: int = 1,
+    per_page: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     return search_logs(db, q, log_level, start_time, end_time, source, page, per_page)
 
 @app.get("/analytics/time-series", response_model=AnalyticsResponse)
-def get_time_series_endpoint(start_time: datetime, end_time: datetime, interval: str = "hour", current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_time_series_endpoint(
+    start_time: datetime,
+    end_time: datetime,
+    interval: str = "hour",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    valid_intervals = ["minute", "hour", "day", "week", "month"]
+    if interval not in valid_intervals:
+        raise HTTPException(status_code=400, detail=f"Invalid interval. Must be one of {valid_intervals}")
     data = get_time_series(db, start_time, end_time, interval)
-    return {"series": [{"name": "Log Entries", "data": data}]}
+    return AnalyticsResponse(series=data)
 
 @app.get("/analytics/distribution", response_model=AnalyticsResponse)
-def get_distribution_endpoint(field: str = "log_level", current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_distribution_endpoint(
+    field: str = "log_level",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    valid_fields = ["log_level", "source"]
+    if field not in valid_fields:
+        raise HTTPException(status_code=400, detail=f"Invalid field. Must be one of {valid_fields}")
     data = get_distribution(db, field)
-    return {"series": data}
+    return AnalyticsResponse(series=[SeriesData(name=field, data=data)])
 
 @app.get("/analytics/top-errors", response_model=AnalyticsResponse)
-def get_top_errors_endpoint(n: int = 10, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_top_errors_endpoint(
+    n: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if n <= 0:
+        raise HTTPException(status_code=400, detail="n must be positive")
     data = get_top_errors(db, n)
-    return {"series": data}
+    return AnalyticsResponse(series=[SeriesData(name="Top Errors", data=data)])
