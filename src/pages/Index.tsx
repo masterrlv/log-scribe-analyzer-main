@@ -1,4 +1,3 @@
-
 import { Link } from "react-router-dom";
 import { Upload, BarChart3, FileText, LogOut } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
@@ -81,11 +80,11 @@ const Index = () => {
             Upload Log File
           </Link>
           <Link 
-            to="/analyze" 
+            to="/history" 
             className="bg-slate-700 hover:bg-slate-600 text-white px-8 py-4 rounded-lg font-semibold text-lg transition-colors inline-flex items-center justify-center gap-2 border border-slate-600"
           >
             <BarChart3 className="w-5 h-5" />
-            View Analysis
+            History
           </Link>
         </div>
       </main>

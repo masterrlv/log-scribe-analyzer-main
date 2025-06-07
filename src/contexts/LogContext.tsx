@@ -1,4 +1,3 @@
-
 import React, { createContext, useContext, useState, ReactNode } from 'react';
 import { apiService, ApiLogEntry, ApiSearchResponse } from '../services/api';
 
@@ -37,12 +36,12 @@ export interface LogAnalysis {
 }
 
 interface LogContextType {
-  logEntries: LogEntry[];
+  logEntries: LogEntry[]; 
   logAnalysis: LogAnalysis | null;
   uploadedFileName: string | null;
   currentUploadId: number | null;
   searchLogs: (params: any) => Promise<void>;
-  uploadLog: (file: File) => Promise<void>;
+  uploadLog: (file: File) => Promise<{ status: string }>;
   refreshAnalysis: () => Promise<void>;
   clearLogData: () => void;
   loading: boolean;
@@ -96,101 +95,111 @@ export const LogProvider = ({ children }: LogProviderProps) => {
     }
   };
 
- // In LogContext.tsx
-const uploadLog = async (file: File) => {
-  try {
-    setLoading(true);
-    const response = await apiService.uploadLogFile(file);
-    setCurrentUploadId(response.upload_id);
-    setUploadedFileName(file.name);
-    
-    // Poll for upload completion
-    const pollStatus = async (): Promise<{ status: string }> => {
-      try {
-        const status = await apiService.getUploadStatus(response.upload_id);
-        if (status.status === 'completed') {
-          await refreshAnalysis();
-          await searchLogs({ per_page: 100 });
-          return { status: 'completed' };
-        } else if (status.status === 'processing') {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          return pollStatus();
-        } else if (status.status === 'failed') {
-          throw new Error('Upload processing failed');
+  const uploadLog = async (file: File) => {
+    try {
+      setLoading(true);
+      const response = await apiService.uploadLogFile(file);
+      setCurrentUploadId(response.upload_id);
+      localStorage.setItem('upload_id', response.upload_id.toString());
+      console.log(response.upload_id,"response.upload_id")
+      setUploadedFileName(file.name);
+
+      // Poll for upload completion
+      const pollStatus = async (): Promise<{ status: string }> => {
+        try {
+          const status = await apiService.getUploadStatus(response.upload_id);
+          if (status.status === 'completed') {
+            await refreshAnalysis();
+            await searchLogs({ per_page: 100, upload_id: response.upload_id });
+            return { status: 'completed' };
+          } else if (status.status === 'processing') {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            return pollStatus();
+          } else if (status.status === 'failed') {
+            throw new Error('Upload processing failed');
+          }
+          return status;
+        } catch (error) {
+          console.error('Error checking upload status:', error);
+          throw error;
         }
-        return status;
-      } catch (error) {
-        console.error('Error checking upload status:', error);
-        throw error;
-      }
-    };
-    
-    return await pollStatus();
-  } catch (error) {
-    console.error('Failed to upload log:', error);
-    throw error;
-  } finally {
-    setLoading(false);
-  }
-};
+      };
+
+      return await pollStatus();
+    } catch (error) {
+      console.error('Failed to upload log:', error);
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const refreshAnalysis = async () => {
     try {
       // Get analytics data from backend
       const [distributionData, timeSeriesData, topErrorsData] = await Promise.all([
         apiService.getDistribution('log_level'),
+        console.log(currentUploadId,"currentUploadId"),
         apiService.getTimeSeries(
           new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
           new Date().toISOString(),
-          'hour'
+          'hour',
+          localStorage.getItem('upload_id')
         ),
+
         apiService.getTopErrors(5)
       ]);
 
       // Convert API data to our LogAnalysis format
-      const logLevelData = distributionData.series.map((item, index) => ({
-        name: item.name || 'Unknown',
-        value: item.value || 0,
-        color: ['#ef4444', '#f59e0b', '#3b82f6', '#6b7280'][index] || '#6b7280'
+      console.log(distributionData,"distributionData")
+      console.log(timeSeriesData,"timeSeriesData")
+      const logLevelData = distributionData.series.map((item: any, index: number) => ({
+        name: item.name,
+        value: item.data.length > 0 ? item.data[0].y : 0,
+        color: ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6'][index % 5]
       }));
 
-      const totalEntries = logLevelData.reduce((sum, item) => sum + item.value, 0);
-      const errorCount = logLevelData.find(item => item.name === 'ERROR')?.value || 0;
-      const warningCount = logLevelData.find(item => item.name === 'WARN')?.value || 0;
-      const infoCount = logLevelData.find(item => item.name === 'INFO')?.value || 0;
-      const debugCount = logLevelData.find(item => item.name === 'DEBUG')?.value || 0;
+     console.log(logLevelData,"logAnalysis s")
+      const timelineData = timeSeriesData.series.length > 0 ? timeSeriesData.series[0].data.map((point: any) => ({
+        time: point.x,
+        errors: point.y,
+        warnings: 0
+      })) : [];
 
-      const analysis: LogAnalysis = {
+      const hourlyDistribution = timeSeriesData.series.length > 0 ? timeSeriesData.series[0].data.map((point: any) => ({
+        hour: point.x.split('T')[1].substring(0, 5),
+        count: point.y
+      })) : [];
+
+      const totalEntries = logLevelData.reduce((sum: number, item: any) => sum + item.value, 0);
+      const errorCount = logLevelData.find((item: any) => item.name === 'ERROR')?.value || 0;
+      const warningCount = logLevelData.find((item: any) => item.name === 'WARNING')?.value || 0;
+      const infoCount = logLevelData.find((item: any) => item.name === 'INFO')?.value || 0;
+      const debugCount = logLevelData.find((item: any) => item.name === 'DEBUG')?.value || 0;
+      const errorRate = totalEntries > 0 ? (errorCount / totalEntries) * 100 : 0;
+
+      const insights = topErrorsData.series.length > 0 ? topErrorsData.series[0].data.map((error: any, index: number) => ({
+        id: index,
+        type: 'error',
+        icon: 'AlertTriangle',
+        title: 'Top Error',
+        description: `${error.x}: ${error.y} occurrences`,
+        severity: 'high' as const,
+        timestamp: new Date().toISOString()
+      })) : [];
+
+      setLogAnalysis({
         totalEntries,
         errorCount,
         warningCount,
         infoCount,
         debugCount,
-        errorRate: totalEntries > 0 ? (errorCount / totalEntries) * 100 : 0,
-        timelineData: timeSeriesData.series[0]?.data?.map(point => ({
-          time: new Date(point.x).getHours().toString().padStart(2, '0') + ':00',
-          errors: point.y,
-          warnings: 0 // Would need separate API call for warnings
-        })) || [],
-        hourlyDistribution: timeSeriesData.series[0]?.data?.map(point => ({
-          hour: new Date(point.x).getHours().toString(),
-          count: point.y
-        })) || [],
+        errorRate,
+        timelineData,
+        hourlyDistribution,
         logLevelData,
-        insights: [
-          {
-            id: 1,
-            type: 'error',
-            icon: 'AlertTriangle',
-            title: 'Top Errors Detected',
-            description: `Found ${topErrorsData.series.length} distinct error patterns in your logs.`,
-            severity: topErrorsData.series.length > 5 ? 'high' : 'medium',
-            timestamp: '2 minutes ago'
-          }
-        ]
-      };
-
-      setLogAnalysis(analysis);
+        insights
+      });
     } catch (error) {
       console.error('Failed to refresh analysis:', error);
     }

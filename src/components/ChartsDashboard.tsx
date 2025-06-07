@@ -26,6 +26,8 @@ const ChartsDashboard = () => {
     logLevelData 
   } = logAnalysis;
 
+
+
   return (
     <div className="space-y-6">
       {/* Summary Cards */}

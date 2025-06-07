@@ -11,6 +11,7 @@ import jwt
 import os
 from passlib.context import CryptContext
 from backend import parser
+from typing import List
 
 # FastAPI app setup
 app = FastAPI()
@@ -18,14 +19,14 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:8080")],
+    allow_origins=[os.getenv("FRONTEND_URL", "http://host.docker.internal:8080")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Database setup
-DATABASE_URL = "postgresql://logs:logs_db@localhost:5432/logs_db"
+DATABASE_URL = "postgresql://logs:logs_db@host.docker.internal:5432/logs_db"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -114,7 +115,16 @@ class DistributionItem(BaseModel):
 class AnalyticsResponse(BaseModel):
     series: list[SeriesData]
 
-# Dependency
+class UploadResponse(BaseModel):
+    id: int
+    filename: str
+    size: int
+    timestamp: str
+    status: str
+    class Config:
+        from_attributes = True
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -183,45 +193,96 @@ def update_upload_status(db: Session, upload_id: int, status: str):
         upload.status = status
         db.commit()
 
-def search_logs(db: Session, q: str = None, log_level: str = None, start_time: datetime = None, end_time: datetime = None, source: str = None, page: int = 1, per_page: int = 20):
+def search_logs(db: Session, q: str = None, log_level: str = None, start_time: datetime = None, 
+               end_time: datetime = None, source: str = None, upload_id: int = None, 
+               page: int = 1, per_page: int = 20):
     query = db.query(LogEntry)
+    print(upload_id)
+    # Filter by upload_id if provided
+    if upload_id is not None:
+        query = query.filter(LogEntry.log_file_id == upload_id)
+        
     if q:
-        query = query.filter(LogEntry.message.contains(q))
+        query = query.filter(LogEntry.message.ilike(f"%{q}%"))
     if log_level:
-        query = query.filter(LogEntry.log_level == log_level)
+        query = query.filter(LogEntry.log_level == log_level.upper())
     if start_time:
         query = query.filter(LogEntry.timestamp >= start_time.strftime("%Y-%m-%d %H:%M:%S"))
     if end_time:
         query = query.filter(LogEntry.timestamp <= end_time.strftime("%Y-%m-%d %H:%M:%S"))
     if source:
         query = query.filter(LogEntry.source == source)
-    
+        
     total = query.count()
-    logs = query.offset((page - 1) * per_page).limit(per_page).all()
+    logs = query.order_by(LogEntry.timestamp.desc()).offset((page - 1) * per_page).limit(per_page).all()
     return SearchResponse(logs=[LogEntryResponse.from_orm(log) for log in logs], total=total, page=page, per_page=per_page)
 
-def get_time_series(db: Session, start_time: datetime, end_time: datetime, interval: str):
+def get_time_series(db: Session, start_time: datetime, end_time: datetime, interval: str, upload_id: int = None):
     time_trunc = func.date_trunc(interval, func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS'))
     query = db.query(time_trunc.label('time'), func.count().label('count')).filter(
         func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS') >= start_time,
         func.to_timestamp(LogEntry.timestamp, 'YYYY-MM-DD HH24:MI:SS') <= end_time
-    ).group_by('time').order_by('time')
+    )
+    
+    # Add upload_id filter if provided
+    if upload_id is not None:
+        query = query.filter(LogEntry.log_file_id == upload_id)
+        
+    query = query.group_by('time').order_by('time')
     results = query.all()
     data = [{"x": row.time.isoformat(), "y": row.count} for row in results]
     return [SeriesData(name="Log Count", data=data)]
 
-def get_distribution(db: Session, field: str):
-    group_field = getattr(LogEntry, field)
-    query = db.query(group_field.label('name'), func.count().label('value')).group_by(group_field)
-    results = query.all()
-    return [DistributionItem(name=row.name, value=row.value) for row in results]
+def get_distribution(db: Session, field: str, upload_id: int = None):
+    try:
+        if field == "log_level":
+            query = db.query(
+                LogEntry.log_level.label('name'),
+                func.count(LogEntry.id).label('value')
+            )
+        elif field == "source":
+            query = db.query(
+                LogEntry.source.label('name'),
+                func.count(LogEntry.id).label('value')
+            )
+        else:
+            return []
+            
+        # Add upload_id filter if provided
+        if upload_id is not None:
+            query = query.filter(LogEntry.log_file_id == upload_id)
+            
+        query = query.group_by('name')
+        results = query.all()
+        return [{"name": str(name) if name else "Unknown", "value": value} for name, value in results]
+    except Exception as e:
+        print(f"Error in get_distribution: {str(e)}")
+        return []
 
-def get_top_errors(db: Session, n: int):
-    query = db.query(LogEntry.message, func.count().label('count')).filter(
-        LogEntry.log_level == 'ERROR'
-    ).group_by(LogEntry.message).order_by(func.count().desc()).limit(n)
-    results = query.all()
-    return [DistributionItem(name=row.message, value=row.count) for row in results]
+def get_top_errors(db: Session, n: int, upload_id: int = None):
+    try:
+        query = db.query(
+            LogEntry.message.label('name'),
+            func.count(LogEntry.id).label('value')
+        ).filter(
+            LogEntry.log_level == 'ERROR'
+        )
+        
+        # Add upload_id filter if provided
+        if upload_id is not None:
+            query = query.filter(LogEntry.log_file_id == upload_id)
+            
+        query = query.group_by(
+            LogEntry.message
+        ).order_by(
+            func.count(LogEntry.id).desc()
+        ).limit(n)
+        
+        results = query.all()
+        return [{"name": str(msg) if msg else "Unknown", "value": count} for msg, count in results]
+    except Exception as e:
+        print(f"Error in get_top_errors: {str(e)}")
+        return []
 
 def parse_log_file(upload_id: int, file_path: str, db: Session = Depends(get_db)):
     try:
@@ -303,46 +364,88 @@ def search_logs_endpoint(
     start_time: datetime = None,
     end_time: datetime = None,
     source: str = None,
+    upload_id: int = None,
     page: int = 1,
     per_page: int = 20,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    return search_logs(db, q, log_level, start_time, end_time, source, page, per_page)
+    print(upload_id)
+    return search_logs(
+        db=db,
+        q=q,
+        log_level=log_level,
+        start_time=start_time,
+        end_time=end_time,
+        source=source,
+        upload_id=upload_id,
+        page=page,
+        per_page=per_page
+    )
+
+@app.get("/logs/upload/history", response_model=List[UploadResponse])
+def get_file_upload_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    uploads = db.query(Upload).filter(Upload.user_id == current_user.id).order_by(Upload.timestamp.desc()).all()
+    for data in uploads:
+        print(data)
+    if not uploads:
+        raise HTTPException(status_code=404, detail="No upload history found")
+    return [UploadResponse.from_orm(upload) for upload in uploads]
 
 @app.get("/analytics/time-series", response_model=AnalyticsResponse)
 def get_time_series_endpoint(
     start_time: datetime,
     end_time: datetime,
     interval: str = "hour",
+    upload_id: str = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    upload_id = int(upload_id)
     valid_intervals = ["minute", "hour", "day", "week", "month"]
     if interval not in valid_intervals:
         raise HTTPException(status_code=400, detail=f"Invalid interval. Must be one of {valid_intervals}")
-    data = get_time_series(db, start_time, end_time, interval)
+    data = get_time_series(db, start_time, end_time, interval, upload_id=upload_id)
+    print("-------------------------")
+    print(data)
+    print(AnalyticsResponse(series=data))
+    print("-------------------------")
     return AnalyticsResponse(series=data)
 
 @app.get("/analytics/distribution", response_model=AnalyticsResponse)
 def get_distribution_endpoint(
     field: str = "log_level",
+    upload_id: int = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     valid_fields = ["log_level", "source"]
     if field not in valid_fields:
         raise HTTPException(status_code=400, detail=f"Invalid field. Must be one of {valid_fields}")
-    data = get_distribution(db, field)
-    return AnalyticsResponse(series=[SeriesData(name=field, data=data)])
+    data = get_distribution(db, field, upload_id=upload_id)
+    # Transform data to match TimeSeriesPoint format
+    formatted_data = [{"x": item["name"], "y": item["value"]} for item in data]
+    print("-------------------------")
+    print(formatted_data)
+    print(AnalyticsResponse(series=[SeriesData(name=field, data=formatted_data)]))
+    print("-------------------------")
+    return AnalyticsResponse(series=[SeriesData(name=field, data=formatted_data)])
 
 @app.get("/analytics/top-errors", response_model=AnalyticsResponse)
 def get_top_errors_endpoint(
     n: int = 10,
+    upload_id: int = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     if n <= 0:
         raise HTTPException(status_code=400, detail="n must be positive")
-    data = get_top_errors(db, n)
-    return AnalyticsResponse(series=[SeriesData(name="Top Errors", data=data)])
+    data = get_top_errors(db, n, upload_id=upload_id)
+    # Transform data to match TimeSeriesPoint format
+    formatted_data = [{"x": item["name"], "y": item["value"]} for item in data]
+
+    print("-------------------------")
+    print(formatted_data)
+    print(AnalyticsResponse(series=[SeriesData(name="Top Errors", data=formatted_data)]))
+    print("-------------------------")
+    return AnalyticsResponse(series=[SeriesData(name="Top Errors", data=formatted_data)])

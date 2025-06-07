@@ -1,4 +1,3 @@
-
 const API_BASE_URL = 'http://localhost:8000';
 
 export interface ApiLogEntry {
@@ -32,6 +31,13 @@ export interface ApiUploadResponse {
 
 export interface ApiUploadStatus {
   status: string;
+}
+
+export interface Upload {
+  id: number;
+  filename: string;
+  timestamp: string;
+  status?: string;
 }
 
 class ApiService {
@@ -133,6 +139,7 @@ class ApiService {
     start_time?: string;
     end_time?: string;
     source?: string;
+    upload_id?: number;
     page?: number;
     per_page?: number;
   }): Promise<ApiSearchResponse> {
@@ -155,11 +162,16 @@ class ApiService {
     return response.json();
   }
 
-  async getTimeSeries(startTime: string, endTime: string, interval: string = 'hour'): Promise<ApiAnalyticsResponse> {
+  async getTimeSeries(startTime: string, endTime: string, interval: string = 'hour', uploadId: string): Promise<ApiAnalyticsResponse> {
     const params = new URLSearchParams({
       start_time: startTime,
       end_time: endTime,
       interval,
+      /**
+       * Optional upload ID to filter time series data by. If not provided,
+       * time series data will be returned for all logs.
+       */
+      upload_id: uploadId
     });
 
     const response = await fetch(`${API_BASE_URL}/analytics/time-series?${params}`, {
@@ -195,6 +207,21 @@ class ApiService {
     }
 
     return response.json();
+  }
+
+  async getUploadHistory(): Promise<Upload[]> {
+    try {
+      const response = await fetch(`${API_BASE_URL}/logs/upload/history`, {
+        headers: this.getHeaders(),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch upload history: ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Error fetching upload history:', error);
+      throw error;
+    }
   }
 
   logout() {
